@@ -1,0 +1,22 @@
+/**
+ * For more details on how to configure Wrangler, refer to:
+ * https://developers.cloudflare.com/workers/wrangler/configuration/
+ */
+{
+	"$schema": "node_modules/wrangler/config-schema.json",
+	"name": "tosyokan-bot",
+	"main": "src/index.ts",
+	"compatibility_date": "2026-02-04",
+	"observability": {
+		"enabled": true
+	},
+	"kv_namespaces": [
+		{
+			"binding": "kv",
+			"id": "0761e0fdc58a4d9e875161a59c62fc00"
+		}
+	],
+	"triggers": {
+		"crons": ["*/15 * * * *"]
+	}
+}

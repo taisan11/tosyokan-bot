@@ -1,0 +1,26 @@
+{
+  "name": "tosyokan-bot",
+  "module": "index.ts",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "register": "bun run register.ts",
+    "dev": "wrangler dev",
+    "typecheck": "bunx tsc --noEmit",
+    "deploy": "wrangler deploy --minify",
+    "log": "wrangler tail",
+    "typegen": "wrangler types"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "discord-api-types": "^0.38.55",
+    "wrangler": "^4.132.0"
+  },
+  "peerDependencies": {
+    "typescript": "^7"
+  },
+  "dependencies": {
+    "cheerio": "^1.2.0",
+    "discord-hono": "^0.22.1"
+  }
+}
