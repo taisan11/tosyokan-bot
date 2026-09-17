@@ -9,7 +9,7 @@ import {
 } from "discord-hono";
 import { load } from "cheerio";
 
-/** A library system which is useful when choosing the right search strategy. */
+/** Supported library-system provider. OPAC is the first supported provider. */
 export type LibraryProvider = "opac" | "unknown";
 
 export interface LibraryRegistration {
@@ -19,15 +19,14 @@ export interface LibraryRegistration {
   label: string;
   addedBy: string;
   createdAt: string;
-  seenItemIds?: string[];
+  seenIsbns?: string[];
 }
 
 export interface Subscription {
   scope: string;
   channelId: string;
-  libraryIds?: string[];
+  libraryId: string;
   createdAt: string;
-  seenByLibrary?: Record<string, string[]>;
 }
 
 export interface SearchResult {
@@ -35,6 +34,12 @@ export interface SearchResult {
   title: string;
   url: string;
   description?: string;
+}
+
+export interface NewArrival {
+  isbn: string;
+  title: string;
+  url: string;
 }
 
 interface ProviderFeedback {
@@ -49,11 +54,11 @@ interface ProviderFeedback {
 
 type Env = { Bindings: { kv: KVNamespace; DISCORD_TOKEN?: string; DISCORD_APPLICATION_ID?: string; DISCORD_PUBLIC_KEY?: string } };
 
-const LIBRARIES_PREFIX = "libraries:";
+const LIBRARIES_PREFIX = "library:";
 const SUBSCRIPTIONS_PREFIX = "subscription:";
+const LIBRARY_SUBSCRIBERS_PREFIX = "subscription-index:library:";
 const PENDING_PROVIDER_PREFIX = "pending-provider:";
 const PROVIDER_FEEDBACK_PREFIX = "provider-feedback:";
-const MAX_LIBRARIES = 25;
 const MAX_RESULTS = 10;
 
 /** Normalize an OPAC URL and reject non-web URLs before persisting it. */
@@ -85,7 +90,7 @@ export function detectProvider(input: string): LibraryProvider {
 }
 
 export function providerLabel(provider: LibraryProvider): string {
-  return { opac: "OPAC", unknown: "未対応" }[provider];
+  return { opac: "OPAC（図書館システム）", unknown: "未対応" }[provider];
 }
 
 function scopeFor(interaction: any): { key: string; label: string } {
@@ -105,14 +110,36 @@ function pendingProviderKey(scope: string, userId: string): string {
 }
 
 function libraryKey(scope: string): string { return `${LIBRARIES_PREFIX}${scope}`; }
+function subscriptionKey(scope: string): string { return `${SUBSCRIPTIONS_PREFIX}${scope}`; }
+function librarySubscribersKey(libraryId: string): string { return `${LIBRARY_SUBSCRIBERS_PREFIX}${libraryId}`; }
 
-async function readLibraries(kv: KVNamespace, scope: string): Promise<LibraryRegistration[]> {
-  const value = await kv.get(libraryKey(scope), "json");
-  return Array.isArray(value) ? value as LibraryRegistration[] : [];
+/** Return guild IDs currently subscribed to a library registration ID. */
+export async function getGuildIdsForLibrary(kv: KVNamespace, libraryId: string): Promise<string[]> {
+  const value = await kv.get<string[]>(librarySubscribersKey(libraryId), { type: "json" });
+  if (!Array.isArray(value)) return [];
+  return Array.from(new Set(value.filter((guildId): guildId is string => typeof guildId === "string" && guildId.length > 0)));
 }
 
-async function writeLibraries(kv: KVNamespace, scope: string, libraries: LibraryRegistration[]) {
-  await kv.put(libraryKey(scope), JSON.stringify(libraries.slice(0, MAX_LIBRARIES)));
+async function addGuildToLibraryIndex(kv: KVNamespace, libraryId: string, guildId: string): Promise<void> {
+  const guildIds = await getGuildIdsForLibrary(kv, libraryId);
+  if (guildIds.includes(guildId)) return;
+  await kv.put(librarySubscribersKey(libraryId), JSON.stringify([...guildIds, guildId]));
+}
+
+async function removeGuildFromLibraryIndex(kv: KVNamespace, libraryId: string, guildId: string): Promise<void> {
+  const guildIds = (await getGuildIdsForLibrary(kv, libraryId)).filter((id) => id !== guildId);
+  if (guildIds.length === 0) await kv.delete(librarySubscribersKey(libraryId));
+  else await kv.put(librarySubscribersKey(libraryId), JSON.stringify(guildIds));
+}
+
+async function readLibrary(kv: KVNamespace, scope: string): Promise<LibraryRegistration | null> {
+  const value = await kv.get<LibraryRegistration>(libraryKey(scope), { type: "json" });
+  return value && typeof value === "object" && !Array.isArray(value) ? value as LibraryRegistration : null;
+}
+
+async function writeLibrary(kv: KVNamespace, scope: string, library: LibraryRegistration | null): Promise<void> {
+  if (library) await kv.put(libraryKey(scope), JSON.stringify(library));
+  else await kv.delete(libraryKey(scope));
 }
 
 function makeId(url: string): string {
@@ -125,27 +152,34 @@ export function buildSearchUrl(library: LibraryRegistration, query: string): str
   const url = new URL(library.url);
   const marker = url.pathname.toLowerCase().indexOf("/opac/");
   const opacRoot = marker >= 0 ? url.pathname.slice(0, marker + "/opac/".length) : "/opac/";
-  url.pathname = `${opacRoot}Search`;
+  // OPAC's free-word search endpoint is shared by the supported systems.
+  // Preserve optional filters such as `mtl`, but always replace the query.
+  url.pathname = `${opacRoot}Free_word_search/search`;
   for (const key of ["q", "query", "keyword", "search", "page"]) url.searchParams.delete(key);
-  url.searchParams.set("keyword", query.trim());
+  url.searchParams.set("q", query.trim());
   return url.toString();
-}
-
-function decodeHtml(text: string): string {
-  return text.replace(/<[^>]+>/g, " ").replace(/&nbsp;/gi, " ").replace(/&amp;/gi, "&").replace(/&lt;/gi, "<").replace(/&gt;/gi, ">").replace(/&#(\d+);/g, (_, code) => String.fromCodePoint(Number(code))).replace(/\s+/g, " ").trim();
 }
 
 export function parseSearchResults(html: string, baseUrl: string): SearchResult[] {
   const results: SearchResult[] = [];
   const seen = new Set<string>();
   const $ = load(html);
-  $("a[href]").each((_index, element) => {
-    const match = $(element);
-    const title = match.text().replace(/\s+/g, " ").trim();
+  // OPAC search pages render each hit as a `li.book`. The page also has many
+  // navigation anchors, so parsing every `a[href]` produces false results.
+  const cards = $("li.book, article.book, .book-list-item, .search-result-item, .result-item");
+  cards.each((_index, element) => {
+    const card = $(element);
+    const titleElement = card.find("h3.item-id-titles, h3.item-id-title-vol-series, .item-id-titles, .item-id-title-vol-series").first();
+    const title = titleElement.text().replace(/\s+/g, " ").trim();
     if (!title || title.length < 2 || title.length > 180) return;
+    const link = titleElement.find("a[href]").first().length
+      ? titleElement.find("a[href]").first()
+      : card.find("a[href*='/hlist'], a[href*='/detail'], a[href*='/show']").first();
+    const href = link.attr("href");
+    if (!href || /^javascript:/i.test(href)) return;
     let url: string;
-    try { url = new URL(match.attr("href") ?? "", baseUrl).toString(); } catch { return; }
-    if (seen.has(url) || /^(検索|ログイン|次へ|前へ|menu|home|詳細|資料検索|新着資料|雑誌タイトル索引|データベース他|ブックリスト|文献依頼|カレンダー|すべて見る|詳しく探す)$/i.test(title)) return;
+    try { url = new URL(href, baseUrl).toString(); } catch { return; }
+    if (seen.has(url)) return;
     seen.add(url);
     results.push({ id: url, title, url });
     if (results.length >= MAX_RESULTS) return false;
@@ -157,92 +191,112 @@ export function parseSearchResults(html: string, baseUrl: string): SearchResult[
 export async function searchLibrary(library: LibraryRegistration, query: string): Promise<SearchResult[]> {
   const target = buildSearchUrl(library, query);
   try {
-    const response = await fetch(target, { signal: AbortSignal.timeout(6000), headers: { accept: "text/html,application/json", "user-agent": "tosyokan-bot/0.1" } });
+    const response = await fetch(target, { signal: AbortSignal.timeout(6000), headers: { accept: "text/html", "user-agent": "tosyokan-bot/0.1" } });
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
-    const type = response.headers.get("content-type") ?? "";
-    if (type.includes("json")) {
-      const json = await response.json() as any;
-      const rows = Array.isArray(json) ? json : json.items ?? json.results ?? [];
-      return rows.slice(0, MAX_RESULTS).map((row: any, index: number) => ({ id: String(row.id ?? row.url ?? index), title: String(row.title ?? row.name ?? "無題"), url: String(row.url ?? target), description: row.description ? String(row.description) : undefined }));
-    }
     return parseSearchResults(await response.text(), target);
   } catch { return []; }
 }
-
-function subscriptionKey(scope: string, channelId: string): string { return `${SUBSCRIPTIONS_PREFIX}${scope}:${channelId}`; }
 
 async function postChannelMessage(rest: any, channelId: string, payload: Record<string, unknown>): Promise<void> {
   await rest("POST", "/channels/{channel.id}/messages" as any, [channelId], payload);
 }
 
-function parseFeed(xml: string, baseUrl: string): SearchResult[] {
-  const results: SearchResult[] = [];
-  const $ = load(xml, { xmlMode: true });
-  $("item, entry").slice(0, MAX_RESULTS).each((_index, element) => {
-    const entry = $(element);
-    const title = entry.find("title").first().text().trim();
-    const linkElement = entry.find("link").first();
-    const href = linkElement.attr("href") ?? linkElement.text().trim();
-    if (!title || !href) return;
-    try { const url = new URL(href, baseUrl).toString(); results.push({ id: entry.find("guid, id").first().text().trim() || url, title, url }); } catch { /* ignore malformed feed entries */ }
+function normalizeIsbn(value: string): string | undefined {
+  const compact = value.replace(/[\s-]/g, "").toUpperCase();
+  if (/^(?:97[89]\d{10}|\d{9}[\dX])$/.test(compact)) return compact;
+  return undefined;
+}
+
+/** Extract the latest books from an OPAC's newly-arrived HTML page. */
+export function parseNewArrivals(html: string, baseUrl: string): NewArrival[] {
+  const results: NewArrival[] = [];
+  const seen = new Set<string>();
+  const $ = load(html);
+  const containers = $("li, article, tr, .book, .book-list-item, .item, .material, .newly-arrived, [class*='book'], [class*='item'], [class*='material'], [class*='new']");
+  containers.each((_index, element) => {
+    const container = $(element);
+    const text = container.text().replace(/\s+/g, " ").trim();
+    const isbn = text.match(/(?:97[89](?:[\s-]?\d){10}|\d(?:[\s-]?\d){8}[\s-]?[\dXx])/g)?.map(normalizeIsbn).find(Boolean);
+    if (!isbn || seen.has(isbn)) return;
+    const link = container.find("a[href]").first();
+    const href = link.attr("href");
+    if (!href) return;
+    let url: string;
+    try { url = new URL(href, baseUrl).toString(); } catch { return; }
+    const title = container.find(".title, .book-title, .item-title, h2, h3, h4").first().text().replace(/\s+/g, " ").trim() || link.text().replace(/\s+/g, " ").trim();
+    if (!title) return;
+    seen.add(isbn);
+    results.push({ isbn, title, url });
+    if (results.length >= MAX_RESULTS) return false;
   });
   return results;
 }
 
-async function pollLibrary(library: LibraryRegistration): Promise<SearchResult[]> {
+async function fetchNewArrivals(library: LibraryRegistration): Promise<NewArrival[]> {
   const base = new URL(library.url);
   const marker = base.pathname.toLowerCase().indexOf("/opac/");
   const opacRoot = marker >= 0 ? base.pathname.slice(0, marker + "/opac/".length) : "/opac/";
-  const candidates = [`${opacRoot}Newly_arrived`, `${opacRoot}rss`, "/rss.xml", "/feed.xml"].map((path) => new URL(path, base).toString());
-  for (const candidate of candidates) {
-    try {
-      const response = await fetch(candidate, { signal: AbortSignal.timeout(4000), headers: { accept: "application/rss+xml,application/atom+xml,text/html,text/xml", "user-agent": "tosyokan-bot/0.1" } });
-      if (response.ok) {
-        const body = await response.text();
-        const results = parseFeed(body, candidate);
-        const htmlResults = results.length ? results : parseSearchResults(body, candidate);
-        if (htmlResults.length) return htmlResults;
-      }
-    } catch { /* try the next common feed path */ }
-  }
-  return searchLibrary(library, "新着");
+  const target = new URL(`${opacRoot}Newly_arrived`, base).toString();
+  try {
+    const response = await fetch(target, { signal: AbortSignal.timeout(6000), headers: { accept: "text/html", "user-agent": "tosyokan-bot/0.1" } });
+    if (!response.ok) return [];
+    return parseNewArrivals(await response.text(), target);
+  } catch { return []; }
 }
 
 async function processSubscriptions(env: Env["Bindings"], rest: any): Promise<void> {
   let cursor: string | undefined;
   do {
-    const listed = await env.kv.list({ prefix: SUBSCRIPTIONS_PREFIX, ...(cursor ? { cursor } : {}) });
+    // Poll once per library ID. Several guilds may subscribe to the same
+    // registration, so iterating subscriptions directly would duplicate the
+    // remote request for every guild.
+    const listed = await env.kv.list({ prefix: LIBRARY_SUBSCRIBERS_PREFIX, ...(cursor ? { cursor } : {}) });
     for (const key of listed.keys) {
-    const subscription = await env.kv.get(key.name, "json") as Subscription | null;
-    if (!subscription) continue;
-    subscription.seenByLibrary ??= {};
-    const libraries = await readLibraries(env.kv, subscription.scope);
-    for (const library of libraries) {
-      if (subscription.libraryIds?.length && !subscription.libraryIds.includes(library.id)) continue;
-      const updates = await pollLibrary(library);
-      const previous = new Set(subscription.seenByLibrary[library.id] ?? []);
-      const fresh = updates.filter((item) => !previous.has(item.id));
-      subscription.seenByLibrary[library.id] = updates.map((item) => item.id).concat(subscription.seenByLibrary[library.id] ?? []).slice(0, 100);
-      if (previous.size > 0 && fresh.length > 0) {
-        const content = [`📚 **${library.label}** に新しい情報があります。`, ...fresh.slice(0, 5).map((item) => `・[${item.title}](${item.url})`)].join("\n");
-        try { await postChannelMessage(rest, subscription.channelId, { content }); } catch { /* channel may have been deleted */ }
+      const libraryId = key.name.slice(LIBRARY_SUBSCRIBERS_PREFIX.length);
+      if (!libraryId) continue;
+      const guildIds = await getGuildIdsForLibrary(env.kv, libraryId);
+      const entries: Array<{ guildId: string; subscription: Subscription; library: LibraryRegistration }> = [];
+      for (const guildId of guildIds) {
+        const scope = `guild:${guildId}`;
+        const subscription = await env.kv.get<Subscription>(subscriptionKey(scope), { type: "json" });
+        if (!subscription || subscription.libraryId !== libraryId) continue;
+        const library = await readLibrary(env.kv, scope);
+        if (library?.id !== libraryId) continue;
+        entries.push({ guildId, subscription, library });
       }
-    }
-      await env.kv.put(key.name, JSON.stringify(subscription));
+      if (!entries.length) continue;
+
+      // All entries in this index point to the same normalized library ID.
+      const firstEntry = entries[0];
+      if (!firstEntry) continue;
+      const updates = await fetchNewArrivals(firstEntry.library);
+      if (!updates.length) continue;
+      for (const entry of entries) {
+        const previous = new Set(entry.library.seenIsbns ?? []);
+        const fresh = updates.filter((item) => !previous.has(item.isbn));
+        entry.library.seenIsbns = updates.map((item) => item.isbn).slice(0, 100);
+        if (previous.size > 0 && fresh.length > 0) {
+          const content = [`📚 **${entry.library.label}** に新着資料があります。`, ...fresh.slice(0, 5).map((item) => `・[${item.title}](${item.url})（ISBN: \`${item.isbn}\`）`)].join("\n");
+          try { await postChannelMessage(rest, entry.subscription.channelId, { content }); } catch { /* channel may have been deleted */ }
+        }
+        await writeLibrary(env.kv, `guild:${entry.guildId}`, entry.library);
+      }
     }
     cursor = listed.list_complete ? undefined : listed.cursor;
   } while (cursor);
 }
 
-const providerInfoModal = makeModal("provider-info", "OPAC対応情報を提供", [
-  makeLabel("サービス名・検索URL", makeTextInput("details", "OPACのサービス名や検索結果URL").required(true).max_length(1000)),
+const providerInfoModal = makeModal("provider-info", "対応図書館の情報提供", [
+  makeLabel("図書館・システム情報", makeTextInput("details", "図書館名、URL、システム名、検索方法").required(true).max_length(1000)),
   makeLabel("チャンネル通知", makeTextInput("notify", "yes または no").required(false).max_length(10).placeholder("yes / no")),
 ]);
 
 export const commands = [
   makeSlashCommand("ping", "接続状態を確認します"),
   makeSlashCommand("register", "図書館のURLを登録します").options([makeStringOption("url", "図書館システムのURL（https://example.jp）").required(true)]),
-  makeSlashCommand("subscribe", "このチャンネルに図書館の更新を通知します").options([makeStringOption("library", "対象の図書館ID（省略すると全て）").required(false)]),
+  makeSlashCommand("unregister", "登録済みの図書館を削除します"),
+  makeSlashCommand("subscribe", "このチャンネルに登録図書館の更新を通知します"),
+  makeSlashCommand("unsubscribe", "このサーバーの更新通知を解除します"),
   makeSlashCommand("search", "登録した図書館を横断検索します").options([makeStringOption("query", "書名・著者・キーワード").required(true), makeIntegerOption("limit", "表示件数（1〜10）").required(false).min_value(1).max_value(10)]),
 ];
 
@@ -262,30 +316,61 @@ const app = new DiscordHono<Env>()
         }), { expirationTtl: 600 });
         return c.resModal(providerInfoModal);
       }
-      const libraries = await readLibraries(c.env.kv, scope.key);
-      const existing = libraries.find((library) => library.url === url);
-      if (existing) return c.flags("EPHEMERAL").res(`既に登録済みです（${existing.id}）。\n${url}`);
+      const library = await readLibrary(c.env.kv, scope.key);
+      if (library) return c.flags("EPHEMERAL").res(`このスコープには既に図書館が登録されています（${library.id}）。\n先に \`/unregister\` で解除してください。`);
       const registration: LibraryRegistration = { id: makeId(url), url, provider, label: displayHost(url), addedBy: actorId(c.interaction), createdAt: new Date().toISOString() };
-      libraries.unshift(registration);
-      await writeLibraries(c.env.kv, scope.key, libraries);
+      await writeLibrary(c.env.kv, scope.key, registration);
       return c.res(`✅ ${scope.label} に登録しました\n**${registration.label}**（${providerLabel(provider)}）\n${url}\nID: \`${registration.id}\`\n\`/subscribe\` で通知を有効にできます。`);
     } catch (error) { return c.flags("EPHEMERAL").res(`登録できませんでした: ${error instanceof Error ? error.message : "URLを確認してください。"}`); }
   })
+  .command("unregister", async (c) => {
+    const scope = scopeFor(c.interaction);
+    const library = await readLibrary(c.env.kv, scope.key);
+    if (!library) return c.flags("EPHEMERAL").res("このスコープには図書館が登録されていません。");
+    const current = c.interaction.guild_id
+      ? await c.env.kv.get<Subscription>(subscriptionKey(scope.key), { type: "json" })
+      : null;
+    await writeLibrary(c.env.kv, scope.key, null);
+    if (c.interaction.guild_id) {
+      await c.env.kv.delete(subscriptionKey(scope.key));
+      for (const libraryId of new Set([library.id, current?.libraryId].filter((id): id is string => Boolean(id)))) {
+        await removeGuildFromLibraryIndex(c.env.kv, libraryId, c.interaction.guild_id);
+      }
+    }
+    return c.res(`🗑️ **${library.label}** を${scope.label}から解除しました。`);
+  })
   .command("subscribe", async (c) => {
+    if (!c.interaction.guild_id) return c.flags("EPHEMERAL").res("`/subscribe` はサーバー内で設定してください。DMに登録した図書館はサーバーの購読対象にはなりません。");
     const scope = scopeFor(c.interaction);
     const channelId = c.interaction.channel_id;
     if (!channelId) return c.flags("EPHEMERAL").res("通知先チャンネルを特定できませんでした。");
-    const libraries = await readLibraries(c.env.kv, scope.key);
-    if (!libraries.length) return c.flags("EPHEMERAL").res("先に `/register url:...` で図書館を登録してください。");
-    const requested = String(option(c, "library") ?? "").trim();
-    const selected = requested ? libraries.find((library) => library.id === requested || library.label === requested) : undefined;
-    if (requested && !selected) return c.flags("EPHEMERAL").res(`図書館IDが見つかりません。登録済み: ${libraries.map((library) => `\`${library.id}\``).join(", ")}`);
-    const key = subscriptionKey(scope.key, channelId);
-    const current = await c.env.kv.get(key, "json") as Subscription | null;
-    const ids = selected ? Array.from(new Set([...(current?.libraryIds ?? []), selected.id])) : undefined;
-    const subscription: Subscription = { scope: scope.key, channelId, libraryIds: ids, createdAt: current?.createdAt ?? new Date().toISOString(), seenByLibrary: current?.seenByLibrary };
-    await c.env.kv.put(key, JSON.stringify(subscription));
-    return c.res(`🔔 ${selected ? `**${selected.label}**` : "登録した図書館すべて"} の更新通知をこのチャンネルで受け取ります。`);
+    const current = await c.env.kv.get<Subscription>(subscriptionKey(scope.key), { type: "json" });
+    if (current && current.channelId !== channelId) {
+      return c.flags("EPHEMERAL").res(`このサーバーはすでに <#${current.channelId}> を購読チャンネルに設定しています。\n先に現在のチャンネルで \`/unsubscribe\` を実行してから、こちらで購読してください。`);
+    }
+    const library = await readLibrary(c.env.kv, scope.key);
+    if (!library) return c.flags("EPHEMERAL").res("先に `/register url:...` で図書館を登録してください。");
+    if (current?.libraryId && current.libraryId !== library.id) {
+      await removeGuildFromLibraryIndex(c.env.kv, current.libraryId, c.interaction.guild_id);
+    }
+    const subscription: Subscription = { scope: scope.key, channelId, libraryId: library.id, createdAt: current?.createdAt ?? new Date().toISOString() };
+    await c.env.kv.put(subscriptionKey(scope.key), JSON.stringify(subscription));
+    await addGuildToLibraryIndex(c.env.kv, library.id, c.interaction.guild_id);
+    return c.res(`🔔 **${library.label}** の更新をこのチャンネルで受け取ります。`);
+  })
+  .command("unsubscribe", async (c) => {
+    if (!c.interaction.guild_id) return c.flags("EPHEMERAL").res("`/unsubscribe` はサーバー内で実行してください。");
+    const scope = scopeFor(c.interaction);
+    const channelId = c.interaction.channel_id;
+    if (!channelId) return c.flags("EPHEMERAL").res("解除元チャンネルを特定できませんでした。");
+    const current = await c.env.kv.get<Subscription>(subscriptionKey(scope.key), { type: "json" });
+    if (!current) return c.flags("EPHEMERAL").res("このサーバーには購読チャンネルが設定されていません。");
+    if (current.channelId !== channelId) {
+      return c.flags("EPHEMERAL").res(`現在の購読チャンネルは <#${current.channelId}> です。そこで \`/unsubscribe\` を実行してください。`);
+    }
+    await c.env.kv.delete(subscriptionKey(scope.key));
+    if (current.libraryId) await removeGuildFromLibraryIndex(c.env.kv, current.libraryId, c.interaction.guild_id);
+    return c.res("🔕 このサーバーの図書館更新通知を解除しました。");
   })
   .command("search", async (c) => {
     const scope = scopeFor(c.interaction);
@@ -293,12 +378,12 @@ const app = new DiscordHono<Env>()
     const limit = Math.min(10, Math.max(1, Number(option(c, "limit") ?? 5)));
     if (!query) return c.flags("EPHEMERAL").res("検索語を入力してください。");
     return c.resDefer(async () => {
-      const libraries = await readLibraries(c.env.kv, scope.key);
-      if (!libraries.length) return c.followup("先に `/register` で図書館を登録してください。");
-      const groups = await Promise.all(libraries.map(async (library) => ({ library, results: await searchLibrary(library, query) })));
-      const lines = groups.flatMap(({ library, results }) => results.slice(0, limit).map((item) => `**${library.label}** · [${item.title}](${item.url})`));
-      if (!lines.length) return c.followup(`「${query}」に一致する結果が見つかりませんでした。\n検索リンク: ${libraries.map((library) => `[${library.label}](${buildSearchUrl(library, query)})`).join(" / ")}`);
-      const body = lines.slice(0, limit * libraries.length).join("\n");
+      const library = await readLibrary(c.env.kv, scope.key);
+      if (!library) return c.followup("先に `/register` で図書館を登録してください。");
+      const results = await searchLibrary(library, query);
+      const lines = results.slice(0, limit).map((item) => `**${library.label}** · [${item.title}](${item.url})`);
+      if (!lines.length) return c.followup(`「${query}」に一致する結果が見つかりませんでした。\n検索リンク: [${library.label}](${buildSearchUrl(library, query)})`);
+      const body = lines.join("\n");
       return c.followup(`🔎 「${query}」の検索結果\n${body.slice(0, 1850)}${body.length > 1850 ? "\n…（結果を一部省略）" : ""}`);
     });
   })
@@ -306,7 +391,7 @@ const app = new DiscordHono<Env>()
     const scope = scopeFor(c.interaction);
     const userId = actorId(c.interaction);
     const pendingKey = pendingProviderKey(scope.key, userId);
-    const pending = await c.env.kv.get(pendingKey, "json") as { scope: string; channelId?: string; userId: string; url: string } | null;
+    const pending = await c.env.kv.get<{ scope: string; channelId?: string; userId: string; url: string }>(pendingKey, { type: "json" });
     if (!pending) return c.flags("EPHEMERAL").res("この入力フォームは期限切れです。もう一度 `/register` を実行してください。");
     const details = String(option(c, "details") ?? "").trim();
     if (!details) return c.flags("EPHEMERAL").res("対応情報が空です。もう一度入力してください。");
@@ -316,10 +401,10 @@ const app = new DiscordHono<Env>()
     await c.env.kv.put(`${PROVIDER_FEEDBACK_PREFIX}${scope.key}:${Date.now()}`, JSON.stringify(feedback));
     await c.env.kv.delete(pendingKey);
     if (notifyChannel && pending.channelId) {
-      try { await postChannelMessage(c.rest, pending.channelId, { content: `📝 <@${userId}> さんから未対応OPACの情報提供を受け付けました。\n${pending.url}` }); } catch { /* channel may no longer be available */ }
+      try { await postChannelMessage(c.rest, pending.channelId, { content: `📝 <@${userId}> さんから対応図書館追加の情報提供を受け付けました。\n${pending.url}` }); } catch { /* channel may no longer be available */ }
     }
-    return c.res(`情報を受け付けました。\n${notifyChannel ? "このチャンネルにも受付通知を送りました。" : "チャンネル通知は送信しませんでした。"}`);
+    return c.res(`対応図書館追加の情報を受け付けました。\n${notifyChannel ? "このチャンネルにも受付通知を送りました。" : "チャンネル通知は送信しませんでした。"}`);
   })
-  .cron("*/15 * * * *", async (c) => processSubscriptions(c.env, c.rest));
+  .cron("0 * * * *", async (c) => processSubscriptions(c.env, c.rest));
 
 export default app;
